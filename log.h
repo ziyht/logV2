@@ -6,10 +6,11 @@
  *  使用的 redisdic 结构是 redis3.0 中的原型, 但是所有的函数都重新封装, 一般情况下不会和正常的 redis 冲突
  *
  *  使用方式:
- *       1. logsysInit()    开启日志系统, 如有必要, 可使用 logsysSet*() 相关函数进行相关设置
- *       2. logCreate()     添加用户日志结构
- *       3. logAdd*()       添加日志到指定的日志结构中, 每次添加会保证把信息写入到关联的文件中
- *       4. logsysRelease() 停止和释放资源, 其实这一步可省略, 日志系统应该时伴随整个程序流程的, 程序结束的时候会自动释放资源
+ *      1. logsysInit()    开启日志系统, 如有必要, 可使用 logsysSet*() 相关函数进行相关设置
+ *      2. logCreate()     添加用户日志结构, 如有必要, 可使用 logSet*() 相关函数进行相关设置
+ *      3. logAdd*()       添加日志到指定的日志结构中, 每次添加会保证把信息写入到关联的文件中
+ *      4. logErr()/...    添加用户调式信息到日志
+ *      5. logsysRelease() 停止和释放资源, 其实这一步可省略, 日志系统应该时伴随整个程序流程的, 程序结束的时候会自动释放资源
  *                          在使用 valgrind 测试时一定要加上这一步
  *
  *  相关说明:
@@ -20,6 +21,7 @@
  *
  * 注意:
  *      本日志系统并没有执行相同文件测试, 即两个日志结构可以指向同一个文件
+ *      本日志并没有做轮询写入, 只是简单清空, 下一版本完善
  *
  * author: ziyht
  *
@@ -27,7 +29,7 @@
  *      1. 修改 logsys* API 参数, 以前为传入日志结构, 现为直接传入 name 字串, 考虑到 logsys* 为日志系统内部使用, 因此 name 不做检测, 而简单作为区分不同日志的标记
  *      2. 添加用户自定义调式日志API: logErr logWarning logInfo
  *      3. 添加系统自定义调式日志API: logsysErr logsysWarning logsysInfo
- *      4. 用户日志 和 系统日志 均添加互斥
+ *      4. 添加多线程安全特性
 */
 
 #include <stdio.h>      // FILE
@@ -44,7 +46,7 @@
 #include <errno.h>
 #include <sys/types.h>
 #include <sys/stat.h>
-#include <pthread.h>
+#include <pthread.h>    // 引入多线程安全
 
 #ifndef LOG_H
 #define LOG_H
@@ -222,7 +224,6 @@ void logAddTextNMute(constr name, constr text, ...);    // 添加 text 到 日�
 void logAdd(constr name, constr text, ...);             // 添加 时间 和 text 到 日志中, 由 (*log).mute 决定是否静默处理
 void logAddMute(constr name, constr text, ...);         // 添加 时间 和 text 到 日志中, 强制静默处理
 void logAddNMute(constr name, constr text, ...);        // 添加 时间 和 text 到 日志中, 强制非静默处理
-
 
 /* ------------------------- log Debug macros  ------------------------------------*/
 // 自定义调式日志的专用 API, 不要直接使用, 请使用下面的宏函数:L_ERR L_WARNING L_INFO
