@@ -1,6 +1,6 @@
-/*  简单日志系统 v2.0
+/*  简单日志系统 v2.0.1
  *  此模块用于简单输出日志到屏幕和写入到文件
- *  系统内部使用 redisdic 维护 日志结构数据, 使用 日志结构的 name 进行区分不同的日志, 用户不用关心底层,
+ *  系统内部使用 redisdic 维护 日志结构数据, 使用 日志结构的 name 进行区分, 用户不用关心底层,
  *  所以即使是多线程, 也可以通过 name 把信息添加到指定的日志结构中
  *
  *  使用的 redisdic 结构是 redis3.0 中的原型, 但是所有的函数都重新封装, 一般情况下不会和正常的 redis 冲突
@@ -23,10 +23,15 @@
  *
  * author: ziyht
  *
+ * 2.0.1 更新:
+ *      1. 修改 logsys* API 参数, 以前为传入日志结构, 现为直接传入 name 字串, 考虑到 logsys* 为日志系统内部使用, 因此 name 不做检测, 而简单作为区分不同日志的标记
+ *      2. 添加用户自定义调式日志API: logErr logWarning logInfo
+ *      3. 添加系统自定义调式日志API: logsysErr logsysWarning logsysInfo
+ *      4. 用户日志 和 系统日志 均添加互斥
 */
 
 #include <stdio.h>      // FILE
-#include <stdbool.h>    //
+#include <stdbool.h>    // bool
 #include <stdint.h>
 #include <time.h>
 #include <unistd.h>
@@ -39,10 +44,10 @@
 #include <errno.h>
 #include <sys/types.h>
 #include <sys/stat.h>
+#include <pthread.h>
 
 #ifndef LOG_H
 #define LOG_H
-
 
 #define LOG_ERR     0
 #define LOG_OK      1
@@ -54,6 +59,8 @@
 
 #define NMUTE false
 #define MUTE  true
+
+typedef const char* constr;
 
 typedef struct Log{
     char* name;         // 本日志的名称, 每次输出的时候都会附带, 以区分不同的日志信息
@@ -128,6 +135,7 @@ typedef struct logdict {
 #define DF_LOGSYS_DIC         NULL    // 日志系统维护的日志结构字典
 #define DF_LOGSYS_DICTYPE     NULL    // 日志字典类型
 
+// 系统日志设置 API
 int  logsysInit();                              // 初始化日志系统
 void logsysStop();                              // 停用日志系统
 void logsysRelease();                           // 停用日志系统 并 释放资源
@@ -135,41 +143,133 @@ void logsysSetMutetype(bool mutetype);          // 设置日志系统静默属�
 int  logsysSetFileSize(size_t size_mb);         // 设置系统日志最大文件大小
 int  logsysFlieEmpty();                         // 清空系统日志文件
 
-// 以下不建议用户使用
-int  logsysShowTime();                              // 当系统日志无法输出(未开启或静默)时, 在控制台上显示时间
-int  logsysShowText(const char* text, ...);         // 当系统日志无法输出(未开启或静默)时, 在控制台上显示 text
-int  logsysShow(const char* text, ...);             // 当系统日志无法输出(未开启或静默)时, 在控制台上显示 时间 和 text
-void logsysAddText(LogPtr log, const char* text, ...);      // 添加 text 到系统日志中, 由系统日志静默属性决定是否输出到控制台
-void logsysAddTextMute(LogPtr log, const char* text, ...);  // 添加 text 到系统日志中, 强制静默
-void logsysAddTextNMute(LogPtr log, const char* text, ...); // 添加 text 到系统日志中, 强制非静默
-void logsysAdd(LogPtr log, const char* text, ...);          // 添加 时间 和 text 到系统日志中, 由系统日志静默属性决定是否输出到控制台
-void logsysAddMute(LogPtr log, const char* text, ...);      // 添加 时间 和 text 到系统日志中, 强制静默
-void logsysAddNMute(LogPtr log, const char* text, ...);     // 添加 时间 和 text 到系统日志中, 强制非静默
+// 系统日志操作 API
+int  logsysShowTime();                                  // 当系统日志无法输出(未开启或静默)时, 在控制台上显示时间
+int  logsysShowText(constr text, ...);                  // 当系统日志无法输出(未开启或静默)时, 在控制台上显示 text
+int  logsysShow(constr name, ...);                      // 当系统日志无法输出(未开启或静默)时, 在控制台上显示 时间 和 text
+void logsysAddText(constr name, constr text, ...);      // 添加 text 到系统日志中, 由系统日志静默属性决定是否输出到控制台
+void logsysAddTextMute(constr name, constr text, ...);  // 添加 text 到系统日志中, 强制静默
+void logsysAddTextNMute(constr name, constr text, ...); // 添加 text 到系统日志中, 强制非静默
+void logsysAdd(constr name, constr text, ...);          // 添加 时间 和 text 到系统日志中, 由系统日志静默属性决定是否输出到控制台
+void logsysAddMute(constr name, constr text, ...);      // 添加 时间 和 text 到系统日志中, 强制静默
+void logsysAddNMute(constr name, constr text, ...);     // 添加 时间 和 text 到系统日志中, 强制非静默
+
+/* ------------------------- logsys Debug macros  ------------------------------------*/
+// DEBUG_FORMAT_STR & DEBUG_FORMAT_SRC 自定义调式格式化字串和源
+#define D_F_STR     "%s(%d)-%s: "
+#define D_F_SRC     __FILE__, __LINE__, __FUNCTION__
+#define D_F_STR_E   "%s(%d)-%s: %s\n"
+#define D_F_SRC_E   __FILE__, __LINE__, __FUNCTION__, strerror(errno)
+
+#define logsysErr(name, format, ...) do{\
+        char* newFormat, * fmtptr = format;char tag[] = "[err]: ";\
+        if(!fmtptr || !*fmtptr){\
+            newFormat = calloc(strlen(tag) + strlen(D_F_STR_E) + 1, 1);\
+            strcat(newFormat, tag);strcat(newFormat, D_F_STR_E);\
+            logsysAdd(name, newFormat, D_F_SRC_E);}\
+        else{\
+            newFormat = calloc(strlen(tag) + strlen(D_F_STR) + strlen(fmtptr) + 1, 1);\
+            strcat(newFormat, tag);strcat(newFormat, D_F_STR);strcat(newFormat, fmtptr);\
+            logsysAdd(name, newFormat, D_F_SRC, ##__VA_ARGS__);}\
+        free(newFormat);\
+    }while(0)
+#define logsysWarning(name, format, ...)  do{\
+        char* newFormat, * fmtptr = format;char tag[] = "[warning]: ";\
+        if(!fmtptr || !*fmtptr){\
+            newFormat = calloc(strlen(tag) + strlen(D_F_STR_E) + 1, 1);\
+            strcat(newFormat, tag);strcat(newFormat, D_F_STR_E);\
+            logsysAdd(name, newFormat, D_F_SRC_E);}\
+        else{\
+            newFormat = calloc(strlen(tag) + strlen(D_F_STR) + strlen(fmtptr) + 1, 1);\
+            strcat(newFormat, tag);strcat(newFormat, D_F_STR);strcat(newFormat, fmtptr);\
+            logsysAdd(name, newFormat, D_F_SRC, ##__VA_ARGS__);}\
+        free(newFormat);\
+    }while(0)
+#define logsysInfo(name, format, ...)  do{\
+        char* newFormat, * fmtptr = format;char tag[] = "[info]: ";\
+        if(!fmtptr || !*fmtptr){\
+            newFormat = calloc(strlen(tag) + strlen(D_F_STR_E) + 1, 1);\
+            strcat(newFormat, tag);strcat(newFormat, D_F_STR_E);\
+            logsysAdd(name, newFormat, D_F_SRC_E);}\
+        else{\
+            newFormat = calloc(strlen(tag) + strlen(D_F_STR) + strlen(fmtptr) + 1, 1);\
+            strcat(newFormat, tag);strcat(newFormat, D_F_STR);strcat(newFormat, fmtptr);\
+            logsysAdd(name, newFormat, D_F_SRC, ##__VA_ARGS__);}\
+        free(newFormat);\
+    }while(0)
 
 /* ------------------------------- log API ------------------------------------*/
-// 独立输出API, 这部分直接输出到 控制台
+// 独立输出API, 这部分直接输出到 控制台, 不影响任何日志
 void logShowTime();                         // 打印当前时间到控制台
-void logShowText(const char* text, ...);    // 打印 text 到控制台, 不添加任何东西, 和 printf 相同的功能
-void logShow(const char* text, ...);        // 打印时间和内容到控制台
+void logShowText(constr text, ...);    // 打印 text 到控制台, 不添加任何东西, 和 printf 相同的功能
+void logShow(constr text, ...);        // 打印时间和内容到控制台
 
-// 创建及修改相关 API
-int    logCreate(const char* name, const char* path, bool mutetype);    // 创建一个 日志 结构
-int    logDestroy(const char* name);                          // 销毁一个 日志 结构
-size_t logFileSize(const char* name);                         // 获取日志结构所指文件的大小
-int    logSetFileSize(const char* name, size_t size_mb);      // 设置文件大小限制, 单位为 MB
-void   logSetMutetype(const char* name, bool mutetype);       // 设置日志结构的 静默 属性
-int    logFlieEmpty(const char* name);                        // 清空结构所指日志文件
+// 用户日志 设置API
+int    logCreate(constr name, constr path, bool mutetype);  // 创建一个 日志 结构
+int    logDestroy(constr name);                             // 销毁一个 日志 结构
+size_t logFileSize(constr name);                            // 获取日志结构所指文件的大小
+int    logSetFileSize(constr name, size_t size_mb);         // 设置文件大小限制, 单位为 MB
+void   logSetMutetype(constr name, bool mutetype);          // 设置日志结构的 静默 属性
+int    logFlieEmpty(constr name);                           // 清空结构所指日志文件
 
-// 添加日志 API
-void logAddTime(const char* name);                            // 添加当前时间到 日志 中, 由 (*log).mute 决定是否静默处理
-void logAddTimeMute(const char* name);                        // 添加当前时间到 日志 中, 强制静默处理
-void logAddTimeNMute(const char* name);                       // 添加当前时间到 日志 中, 强制非静默处理
-void logAddText(const char* name, const char* text, ...);     // 添加 text 到 日志 中, 由 (*log).mute 决定是否静默处理
-void logAddTextMute(const char* name, const char* text, ...); // 添加 text 到 日志 中, 强制静默处理
-void logAddTextNMute(const char* name, const char* text, ...);// 添加 text 到 日志 中, 强制非静默处理
-void logAdd(const char* name, const char* text, ...);         // 添加 时间 和 text 到 日志中, 由 (*log).mute 决定是否静默处理
-void logAddMute(const char* name, const char* text, ...);     // 添加 时间 和 text 到 日志中, 强制静默处理
-void logAddNMute(const char* name, const char* text, ...);    // 添加 时间 和 text 到 日志中, 强制非静默处理
+// 用户日志 操作API
+void logAddTime(constr name);                           // 添加当前时间到 日志 中, 由 (*log).mute 决定是否静默处理
+void logAddTimeMute(constr name);                       // 添加当前时间到 日志 中, 强制静默处理
+void logAddTimeNMute(constr name);                      // 添加当前时间到 日志 中, 强制非静默处理
+void logAddText(constr name, constr text, ...);         // 添加 text 到 日志 中, 由 (*log).mute 决定是否静默处理
+void logAddTextMute(constr name, constr text, ...);     // 添加 text 到 日志 中, 强制静默处理
+void logAddTextNMute(constr name, constr text, ...);    // 添加 text 到 日志 中, 强制非静默处理
+void logAdd(constr name, constr text, ...);             // 添加 时间 和 text 到 日志中, 由 (*log).mute 决定是否静默处理
+void logAddMute(constr name, constr text, ...);         // 添加 时间 和 text 到 日志中, 强制静默处理
+void logAddNMute(constr name, constr text, ...);        // 添加 时间 和 text 到 日志中, 强制非静默处理
+
+
+/* ------------------------- log Debug macros  ------------------------------------*/
+// 自定义调式日志的专用 API, 不要直接使用, 请使用下面的宏函数:L_ERR L_WARNING L_INFO
+void logAddDebug(constr name, constr text, ...);
+
+/** L_ERR/L_WARNING/L_INFO - 输出自定义调式信息
+ * @param name   日志名
+ * @param format 格式化字串 若为NULL或空串, 输出系统错误; 否则, 输出自定义信息
+ *
+*/
+#define logErr(name, format, ...) do{\
+        char* newFormat, * fmtptr = format;char tag[] = "[err]: ";\
+        if(!fmtptr || !*fmtptr){\
+            newFormat = calloc(strlen(tag) + strlen(D_F_STR_E) + 1, 1);\
+            strcat(newFormat, tag);strcat(newFormat, D_F_STR_E);\
+            logAddDebug(name, newFormat, D_F_SRC_E);}\
+        else{\
+            newFormat = calloc(strlen(tag) + strlen(D_F_STR) + strlen(fmtptr) + 1, 1);\
+            strcat(newFormat, tag);strcat(newFormat, D_F_STR);strcat(newFormat, fmtptr);\
+            logAddDebug(name, newFormat, D_F_SRC, ##__VA_ARGS__);}\
+        free(newFormat);\
+    }while(0)
+#define logWarning(name, format, ...) do{\
+        char* newFormat, * fmtptr = format;char tag[] = "[warming]: ";\
+        if(!fmtptr || !*fmtptr){\
+            newFormat = calloc(strlen(tag) + strlen(D_F_STR_E) + 1, 1);\
+            strcat(newFormat, tag);strcat(newFormat, D_F_STR_E);\
+            logAddDebug(name, newFormat, D_F_SRC_E);}\
+        else{\
+            newFormat = calloc(strlen(tag) + strlen(D_F_STR) + strlen(fmtptr) + 1, 1);\
+            strcat(newFormat, tag);strcat(newFormat, D_F_STR);strcat(newFormat, fmtptr);\
+            logAddDebug(name, newFormat, D_F_SRC, ##__VA_ARGS__);}\
+        free(newFormat);\
+    }while(0)
+#define logInfo(name, format, ...) do{\
+        char* newFormat, * fmtptr = format;char tag[] = "[info]: ";\
+        if(!fmtptr || !*fmtptr){\
+            newFormat = calloc(strlen(tag) + strlen(D_F_STR_E) + 1, 1);\
+            strcat(newFormat, tag);strcat(newFormat, D_F_STR_E);\
+            logAddDebug(name, newFormat, D_F_SRC_E);}\
+        else{\
+            newFormat = calloc(strlen(tag) + strlen(D_F_STR) + strlen(fmtptr) + 1, 1);\
+            strcat(newFormat, tag);strcat(newFormat, D_F_STR);strcat(newFormat, fmtptr);\
+            logAddDebug(name, newFormat, D_F_SRC, ##__VA_ARGS__);}\
+        free(newFormat);\
+    }while(0)
+
 
 /* ------------------------------- Test Function ------------------------------------*/
 // ...

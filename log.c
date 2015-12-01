@@ -21,34 +21,46 @@ static void _logdictRelease(logdict *d);                              // 将字�
 static logdictEntry* _logdictFind(logdict *d, const char *key);       // 在字典中查找 key 并返回找到的 entry（会遍历 ht[0]和ht[1]）
 static LogPtr _logdictFetchValue(logdict *d, const char *key);        // 查找并返回指定 key 对应的 valv
 
+/* -------------------- logsys private prototypes ------------------------------------*/
+static LogPtr       _sys_log         = DF_SYS_LOG;          // 系统日志结构指针
+static bool         _logsys_service  = DF_LOGSYS_SERVICE;   // 系统日志初始化状态, 只有为 true , 以下 SET API 才有效
+static bool         _logsys_mutetype = DF_LOGSYS_MUTETYPE;  // 系统日志静默属性, 默认静默
+static size_t       _logsys_filesize = DF_LOGSYS_FILESIZE;  // 系统日志大小, 默认为 1 M
+static logdict*     _logsys_dic      = DF_LOGSYS_DIC;       // 日志系统维护的日志结构字典
+static logdictType* _logsys_dictype  = DF_LOGSYS_DICTYPE;   // 日志字典类型
 
-/* -------------------------- log private prototypes ---------------------------- */
+static pthread_mutex_t consoleLocker;    // 控制台锁
+static pthread_mutex_t sysfileLocker;    // 系统日志文件锁
+static pthread_mutex_t fileLocker;       // 用户日志文件锁
+
+
+
 #define TS_LOG  0
 #define TS_FILE 1
-static char* _timeStr(int type);                                    // 返回一个存储当前本地时间的静态字符串指针
+static char* _timeStr(int type);                            // 返回一个存储当前本地时间的静态字符串指针
 
 typedef int status;
 #define FILE_NOTEXIST   0
 #define FILE_NOTWRITE   2
 #define FILE_CANWRITE   1
-static status _GetFileStatus(const char* path);                     // 获取文件状态
+static status _GetFileStatus(constr path);                     // 获取文件状态
 
 #define MAX_PATH_LENGTH     255
-static char* _logPath(const char* dir, const char* name);           // 获取一个临时的 path 字串, 不要 free
+static char* _logPath(constr dir, constr name);           // 获取一个临时的 path 字串, 不要 free
 
-static void _mkdir(const char* path, mode_t mode);                  // 根据路径依次创建文件夹, 直到文件的最底层
+static void _mkdir(constr name, constr path, mode_t mode);// 根据路径依次创建文件夹, 直到文件的最底层
 static void _logFileShrink(LogPtr log);                             // 若 日志文件 已达上限, 则清空文件
-static LogPtr _logGenerate(const char* name, const char* path, bool mutetype);
+static LogPtr _logGenerate(constr name, constr path, bool mutetype);
 static void _logReset(LogPtr log);
 static size_t _logFileSize(LogPtr log);
 static int _logFlieEmpty(LogPtr log);
 
 /* ---------------------- logcheck private prototypes ---------------------------- */
-static int _check_logsys(const char* name, const char* tag);         // 检查服务是否开启, 并输出相应提示信息
-static int _check_name(const char* name, const char* tag);           // 检查 name 是否合法, 并输出相应提示信息
-static int _check_path(const char* path, const char* tag);           // 检查 path 是否合法, 并输出相应提示信息
-static LogPtr _check_log(const char* name, const char* tag);         // 检查 log 是否存在, 并输出相应提示信息
-static int _check_size_mb(size_t size_mb, const char* name, const char* tag);  // 检查 log 是否存在, 并输出相应提示信息
+static int _check_logsys(constr name, constr tag);         // 检查服务是否开启, 并输出相应提示信息
+static int _check_name(constr name, constr tag);           // 检查 name 是否合法, 并输出相应提示信息
+static int _check_path(constr path, constr tag);           // 检查 path 是否合法, 并输出相应提示信息
+static LogPtr _check_log(constr name, constr tag);         // 检查 log 是否存在, 并输出相应提示信息
+static int _check_size_mb(size_t size_mb, constr name, constr tag);  // 检查 log 是否存在, 并输出相应提示信息
 
 
 /* ----------------------------- logdict implementation ------------------------- */
@@ -443,15 +455,7 @@ LogPtr _logdictFetchValue(logdict *d, const char *key) {
     return he ? logdictGetVal(he) : NULL;
 }
 
-/* ------------------------------- logsys API ------------------------------------*/
-static LogPtr       _sys_log         = DF_SYS_LOG;          // 系统日志结构指针
-static bool         _logsys_service  = DF_LOGSYS_SERVICE;   // 系统日志初始化状态, 只有为 true , 以下 SET API 才有效
-static bool         _logsys_mutetype = DF_LOGSYS_MUTETYPE;  // 系统日志静默属性, 默认静默
-static size_t       _logsys_filesize = DF_LOGSYS_FILESIZE;  // 系统日志大小, 默认为 1 M
-static logdict*     _logsys_dic      = DF_LOGSYS_DIC;       // 日志系统维护的日志结构字典
-static logdictType* _logsys_dictype  = DF_LOGSYS_DICTYPE;   // 日志字典类型
-
-
+/* ------------------------------- logsys implitation ------------------------------------*/
 unsigned int _loghashFunction (const void *key)
 {
      return _dictGenHashFunction(key, strlen(key));
@@ -505,6 +509,12 @@ int logsysInit()
            return LOG_ERR;
         }
     }
+
+    /* 初始化互斥量 */
+    pthread_mutex_init(&consoleLocker, 0);
+    pthread_mutex_init(&sysfileLocker, 0);
+    pthread_mutex_init(&fileLocker, 0);
+
     logsysAddText(NULL, " ok\n");
     logsysAdd(NULL, "[-------------- log system initial ok -----------------]\n");
     return LOG_OK;
@@ -538,6 +548,10 @@ void logsysRelease()
         free(_logsys_dictype);
         _logsys_dictype = NULL;
     }
+
+    pthread_mutex_destroy(&consoleLocker);
+    pthread_mutex_destroy(&sysfileLocker);
+    pthread_mutex_destroy(&fileLocker);
 }
 
 /**
@@ -618,7 +632,7 @@ int logsysShowTime()
 
     return LOG_ERR;
 }
-int logsysShowText(const char* text, ...)
+int logsysShowText(constr text, ...)
 {
     if(!text || !(*text)) return LOG_ERR;
 
@@ -627,45 +641,56 @@ int logsysShowText(const char* text, ...)
 
     // 如果服务未开启, logsys*不会有输出, 所以强制输出
     if(!_logsys_service){
+        pthread_mutex_lock(&consoleLocker);
         vfprintf(stderr, text, argptr);
-        return LOG_ERR;
-    }
-    // 服务开启, 且是 静默模式, logsys*不会有输出, 所以输出
-    if(_logsys_mutetype)
-        vfprintf(stderr, text, argptr);
-
-    va_end(argptr);
-    return LOG_ERR;
-}
-int logsysShow(const char* text, ...)
-{
-    if(!text || !(*text)) return LOG_ERR;
-
-    va_list argptr;
-    va_start(argptr, text);
-
-    // 如果服务未开启, logsys*不会有输出, 所以强制输出
-    if(!_logsys_service){
-        fprintf(stderr, "%s", _timeStr(TS_LOG));
-        vfprintf(stderr, text, argptr);
+        pthread_mutex_unlock(&consoleLocker);
+        va_end(argptr);
         return LOG_ERR;
     }
     // 服务开启, 且是 静默模式, logsys*不会有输出, 所以输出
     if(_logsys_mutetype){
+        pthread_mutex_lock(&consoleLocker);
+        vfprintf(stderr, text, argptr);
+        pthread_mutex_unlock(&consoleLocker);
+        va_end(argptr);
+        return LOG_ERR;
+    }
+    return LOG_ERR;
+}
+int logsysShow(constr text, ...)
+{
+    if(!text || !(*text)) return LOG_ERR;
+
+    va_list argptr;
+    va_start(argptr, text);
+
+    // 如果服务未开启, logsys*不会有输出, 所以强制输出
+    if(!_logsys_service){
+        pthread_mutex_lock(&consoleLocker);
         fprintf(stderr, "%s", _timeStr(TS_LOG));
         vfprintf(stderr, text, argptr);
+        pthread_mutex_unlock(&consoleLocker);
+        va_end(argptr);
+        return LOG_ERR;
     }
-
-    va_end(argptr);
+    // 服务开启, 且是 静默模式, logsys*不会有输出, 所以输出
+    if(_logsys_mutetype){
+        pthread_mutex_lock(&consoleLocker);
+        fprintf(stderr, "%s", _timeStr(TS_LOG));
+        vfprintf(stderr, text, argptr);
+        pthread_mutex_unlock(&consoleLocker);
+        va_end(argptr);
+        return LOG_ERR;
+    }
     return LOG_ERR;
 }
 
 /**
  * @brief logsysAddText - 添加 Text 到系统日志
- * @param log   现在操作的日志, 主要是为了得到 log->name, 用以区分, 可以为 NULL
+ * @param name  日志名, 这里其实为标记, 用以区分不同的日志, logsys 默认为日志系统内部使用, 所以不检测存在性
  * @param text  内容
  */
-void logsysAddText(LogPtr log, const char* text, ...)
+void logsysAddText(constr name, constr text, ...)
 {
     if(!_logsys_service || !_sys_log || !text || !(*text))  return;
 
@@ -675,25 +700,24 @@ void logsysAddText(LogPtr log, const char* text, ...)
     va_start(argptr, text);
 
     /* 写入日志到 系统日志 中 */
-    if(log && log->name)
-        fprintf(_sys_log->fp, "[%s] ", log->name);
+    pthread_mutex_lock(&sysfileLocker);
+    if(name)    fprintf(_sys_log->fp, "[%s] ", name);
     vfprintf(_sys_log->fp, text, argptr);
     fflush(_sys_log->fp);
-
-    /* 输出日志到 控制台 中 */
+    pthread_mutex_unlock(&sysfileLocker);
+    /* 如果需要, 输出日志到控制台 */
     if(!_sys_log->mutetype)
     {
+        pthread_mutex_lock(&consoleLocker);
         va_start(argptr, text);
-        if(log && log->name)
-        {
-            fprintf(stderr, "[%s] ", log->name);
-        }
+        if(name)    fprintf(stderr, "[%s] ", name);
         vfprintf(stderr, text, argptr);
+        pthread_mutex_unlock(&consoleLocker);
     }
 
     va_end(argptr);
 }
-void logsysAddTextMute(LogPtr log, const char* text, ...)
+void logsysAddTextMute(constr name, constr text, ...)
 {
     if(!_logsys_service || !_sys_log || !text || !(*text))  return;
 
@@ -703,16 +727,15 @@ void logsysAddTextMute(LogPtr log, const char* text, ...)
     va_start(argptr, text);
 
     /* 写入日志到 系统日志 中 */
-    if(log && log->name)
-    {
-        fprintf(_sys_log->fp, "[%s] ", log->name);
-    }
+    pthread_mutex_lock(&sysfileLocker);
+    if(name)    fprintf(_sys_log->fp, "[%s] ", name);
     vfprintf(_sys_log->fp, text, argptr);
     fflush(_sys_log->fp);
+    pthread_mutex_unlock(&sysfileLocker);
 
     va_end(argptr);
 }
-void logsysAddTextNMute(LogPtr log, const char* text, ...)
+void logsysAddTextNMute(constr name, constr text, ...)
 {
     if(!_logsys_service || !_sys_log || !text || !(*text))  return;
 
@@ -722,26 +745,28 @@ void logsysAddTextNMute(LogPtr log, const char* text, ...)
     va_start(argptr, text);
 
     /* 写入日志到 系统日志 中 */
-    if(log && log->name)
-        fprintf(_sys_log->fp, "[%s] ", log->name);
+    pthread_mutex_lock(&sysfileLocker);
+    if(name)    fprintf(_sys_log->fp, "[%s] ", name);
     vfprintf(_sys_log->fp, text, argptr);
     fflush(_sys_log->fp);
+    pthread_mutex_unlock(&sysfileLocker);
 
     /* 输出日志到 控制台 中 */
+    pthread_mutex_lock(&consoleLocker);
     va_start(argptr, text);
-    if(log && log->name)
-        fprintf(stderr, "[%s] ", log->name);
+    if(name)    fprintf(stderr, "[%s] ", name);
     vfprintf(stderr, text, argptr);
+    pthread_mutex_unlock(&consoleLocker);
 
     va_end(argptr);
 }
 
 /**
  * @brief logsysAdd - 添加日志到系统日志
- * @param log   现在操作的日志, 主要是为了得到 log->name, 用以区分, 可以为 NULL
+ * @param name  日志名, 这里其实为标记, 用以区分不同的日志, logsys 默认为日志系统内部使用, 所以不检测存在性
  * @param text  内容
  */
-void logsysAdd(LogPtr log, const char* text, ...)
+void logsysAdd(constr name, constr text, ...)
 {
     if(!_logsys_service || !_sys_log || !text || !(*text))  return;
 
@@ -751,20 +776,21 @@ void logsysAdd(LogPtr log, const char* text, ...)
     va_start(argptr, text);
 
     /* 写入日志到 系统日志 中 */
+    pthread_mutex_lock(&sysfileLocker);
     fprintf(_sys_log->fp, "%s", _timeStr(TS_LOG));
-    if(log && log->name)
-        fprintf(_sys_log->fp, "[%s] ", log->name);
+    if(name) fprintf(_sys_log->fp, "[%s] ", name);
     vfprintf(_sys_log->fp, text, argptr);
     fflush(_sys_log->fp);
-
+    pthread_mutex_unlock(&sysfileLocker);
     /* 输出日志到 控制台 中 */
     if(!_sys_log->mutetype)
     {
+        pthread_mutex_lock(&consoleLocker);
         va_start(argptr, text);
         fprintf(stderr, "%s", _timeStr(TS_LOG));
-        if(log && log->name)
-            fprintf(stderr, "[%s] ", log->name);
+        if(name) fprintf(stderr, "[%s] ", name);
         vfprintf(stderr, text, argptr);
+        pthread_mutex_unlock(&consoleLocker);
     }
 
     va_end(argptr);
@@ -775,7 +801,7 @@ void logsysAdd(LogPtr log, const char* text, ...)
  * @param log   现在操作的日志, 主要是为了得到 log->name, 用以区分, 可以为 NULL
  * @param text  内容
  */
-void logsysAddMute(LogPtr log, const char* text, ...)
+void logsysAddMute(constr name, constr text, ...)
 {
     if(!_logsys_service || !_sys_log || !text || !(*text))  return;
 
@@ -785,13 +811,12 @@ void logsysAddMute(LogPtr log, const char* text, ...)
     va_start(argptr, text);
 
     /* 写入日志到 系统日志 中 */
+    pthread_mutex_lock(&sysfileLocker);
     fprintf(_sys_log->fp, "%s", _timeStr(TS_LOG));
-    if(log && log->name)
-    {
-        fprintf(_sys_log->fp, "[%s] ", log->name);
-    }
+    if(name)    fprintf(_sys_log->fp, "[%s] ", name);
     vfprintf(_sys_log->fp, text, argptr);
     fflush(_sys_log->fp);
+    pthread_mutex_unlock(&sysfileLocker);
 
     va_end(argptr);
 }
@@ -800,7 +825,7 @@ void logsysAddMute(LogPtr log, const char* text, ...)
  * @param log   现在操作的日志, 主要是为了得到 log->name, 用以区分, 可以为 NULL
  * @param text  内容
  */
-void logsysAddNMute(LogPtr log, const char* text, ...)
+void logsysAddNMute(constr name, constr text, ...)
 {
     if(!_logsys_service || !_sys_log || !text || !(*text))  return;
 
@@ -810,26 +835,23 @@ void logsysAddNMute(LogPtr log, const char* text, ...)
     va_start(argptr, text);
 
     /* 写入日志到 系统日志 中 */
+    pthread_mutex_lock(&sysfileLocker);
     fprintf(_sys_log->fp, "%s", _timeStr(TS_LOG));
-    if(log && log->name)
-    {
-        fprintf(_sys_log->fp, "[%s] ", log->name);
-    }
+    if(name)    fprintf(_sys_log->fp, "[%s] ", name);
     vfprintf(_sys_log->fp, text, argptr);
     fflush(_sys_log->fp);
+    pthread_mutex_unlock(&sysfileLocker);
 
     /* 输出日志到 控制台 中 */
     va_start(argptr, text);
+    pthread_mutex_lock(&consoleLocker);
     fprintf(stderr, "%s", _timeStr(TS_LOG));
-    if(log && log->name)
-    {
-        fprintf(stderr, "[%s] ", log->name);
-    }
+    if(name)    fprintf(stderr, "[%s] ", name);
     vfprintf(stderr, text, argptr);
+    pthread_mutex_unlock(&consoleLocker);
 
     va_end(argptr);
 }
-
 
 /* ----------------------------- API implementation ------------------------- */
 
@@ -844,7 +866,7 @@ void logShowTime()
  * @brief logShowText - 显示 text 到控制台
  * @param text
  */
-void logShowText(const char* text, ...)
+void logShowText(constr text, ...)
 {
     if(!text || !(*text)) return;
 
@@ -859,7 +881,7 @@ void logShowText(const char* text, ...)
  * @brief logShow - 输出 时间 和 text 到控制台
  * @param text
  */
-void logShow(const char* text, ...)     // 打印时间和内容到控制台
+void logShow(constr text, ...)     // 打印时间和内容到控制台
 {
     if(!text || !(*text)) return;
 
@@ -889,12 +911,12 @@ void _logReset(LogPtr log)
  * @return 成功返回 LOG_OK; 失败返回 LOG_ERR
  * @note   如果返回 LOG_OK, 说明 路径一定合法, 并且已成功打开
  */
-static int _logInit(LogPtr log, const char* name, const char* path, bool mutetype)
+static int _logInit(LogPtr log, constr name, constr path, bool mutetype)
 {
     if(name && *name) log->name = strdup(name);
     if(path && *path)
     {
-        _mkdir(path, 0755);
+        _mkdir(log->name, path, 0755);
         log->path     = strdup(path);
         log->fp       = fopen(log->path, "a+");
         log->maxsize  = DF_LOG_SIZE << 20;          // 默认日志文件大小 DF_LOG_SIZE MB
@@ -902,7 +924,7 @@ static int _logInit(LogPtr log, const char* name, const char* path, bool mutetyp
     }
     if(!path || !log->fp)
     {
-        logsysAddNMute(log, "%s(%d)-%s:%s\n", __FILE__, __LINE__, __FUNCTION__ ,strerror(errno));
+        logsysWarning(name, "Can not Create file \"%s\", %s\n", path, strerror(errno));
         return LOG_ERR;
     }
 
@@ -917,7 +939,7 @@ static int _logInit(LogPtr log, const char* name, const char* path, bool mutetyp
  * @return 创建的日志结构指针, 若失败, 则返回 NULL
  * @note   只要返回值不为 NULL, 那么 path 和 fp 肯定不是 NULL
  */
-LogPtr _logGenerate(const char* name, const char* path, bool mutetype)
+LogPtr _logGenerate(constr name, constr path, bool mutetype)
 {
     LogPtr r_log = (LogPtr)calloc(sizeof(*r_log), 1);
     status f_s = _GetFileStatus(path);
@@ -933,21 +955,21 @@ LogPtr _logGenerate(const char* name, const char* path, bool mutetype)
             _logReset(r_log);
         case FILE_NOTWRITE:
             /* 在程序目录下产生临时文件进行初始化, 如果失败, 那么销毁 log, 返回 null  */
-            logsysAddNMute(NULL, "[%s] Generating log struct err: file \"%s\" cannot write -> try to create a temp file...\n", name, path);
+            logsysWarning(name, "Generating log struct err: file open err -> try to create a temp file...\n");
             if(LOG_ERR == _logInit(r_log, name, _logPath(DF_LOG_DIR, name), mutetype))
             {
-                logsysAddNMute(NULL, "[%s] Generating log struct err: cannot create temp file \"%s\"]", name, r_log->path);
+                logsysErr(name, "Generating log struct err: cannot create temp file \"%s\"]", r_log->path);
                 _logReset(r_log);
                 free(r_log);
                 return r_log = NULL;
             }
-            logsysAddNMute(r_log, "Create temp file \"%s\"\n", r_log->path);
+            logsysInfo(name, "Create temp file \"%s\"\n", r_log->path);
     }
-    logsysAdd(r_log, "Generating log struct ok\n");
+    logsysAdd(name, "Generating log struct ok\n");
     return r_log;
 }
 
-int logCreate(const char* name, const char* path, bool mutetype)
+int logCreate(constr name, constr path, bool mutetype)
 {
     logsysAdd(NULL, "[%s] --CreateLog... \n", name);
     if(LOG_ERR == _check_logsys(name, "--Creating"))    return LOG_ERR;
@@ -967,13 +989,13 @@ int logCreate(const char* name, const char* path, bool mutetype)
         // 运行到这里, 说明 name 已经插入到字典中, 所以需要先设置值为 NULL, 再从字典中删除
         logdictSetVal(_logsys_dic, entry, NULL);    // 这一步时必要的, _logdictAddRaw 内部使用 malloc, 不置 NULL 可能引起段错误
         _logdictDelete(_logsys_dic, name);
-        logsysAdd(NULL, "[%s] --Creating... err: Generating log struct failed \n", name, name);
-        return logsysShow("[%s] --Creating... err: Generating log struct failed \n", name, name);
+        logsysAdd(NULL, "[%s] --Creating... err: Generating log struct failed \n", name);
+        return LOG_ERR;
     }
 
     /* 设置值 */
     logdictSetVal(_logsys_dic, entry, log);
-    logsysAdd(log, "--CreateLog... ok: link file \"%s\" \n", log->path);
+    logsysAdd(name, "--CreateLog... ok: link file \"%s\" \n", log->path);
     logAddTextMute(log->name, "\n");
 
     return LOG_OK;
@@ -983,7 +1005,7 @@ int logCreate(const char* name, const char* path, bool mutetype)
  * @brief logDestroy - 销毁一个日志结构, 释放内存
  * @param log   要销毁的日志结构指针
  */
-int logDestroy(const char* name)
+int logDestroy(constr name)
 {
     if(LOG_ERR == _check_logsys(name, "--DestroyLog"))    return LOG_ERR;
     if(LOG_ERR == _check_name(name, "--DestroyLog"))      return LOG_ERR;
@@ -1003,7 +1025,7 @@ int logDestroy(const char* name)
  * @param name
  * @return 大小, 单位为字节
  */
-size_t logFileSize(const char* name)
+size_t logFileSize(constr name)
 {
     LogPtr log;
     /* 检测未通过, 返回 err */
@@ -1020,7 +1042,7 @@ size_t logFileSize(const char* name)
  * @param size_mb   大小, 单位为 MB
  * @return 失败返回 -1, 成功返回设置后的大小
  */
-int logSetFileSize(const char* name, size_t size_mb)
+int logSetFileSize(constr name, size_t size_mb)
 {
     LogPtr log;
     /* 检测未通过, 返回 err */
@@ -1030,7 +1052,7 @@ int logSetFileSize(const char* name, size_t size_mb)
     if(!(log = _check_log(name, "--SetFileSize"))) return LOG_ERR;
 
     log->maxsize = size_mb << 20;
-    logsysAdd(log, "--SetFileSize... ok: set file max size to %d \n", log->maxsize);
+    logsysAdd(name, "--SetFileSize... ok: set file max size to %d \n", log->maxsize);
     return log->maxsize;
 }
 
@@ -1039,7 +1061,7 @@ int logSetFileSize(const char* name, size_t size_mb)
  * @param name
  * @param mutetype
  */
-void logSetMutetype(const char* name, bool mutetype)
+void logSetMutetype(constr name, bool mutetype)
 {
     LogPtr log;
     /* 检测未通过, 返回 err */
@@ -1049,9 +1071,9 @@ void logSetMutetype(const char* name, bool mutetype)
 
     log->mutetype = mutetype;
     if(mutetype)
-        logsysAdd(log, "--SetMutetype... ok: set mutetype to MUTE \n");
+        logsysAdd(name, "--SetMutetype... ok: set mutetype to MUTE \n");
     else
-        logsysAdd(log, "--SetMutetype... ok: set mutetype to NMUTE \n");
+        logsysAdd(name, "--SetMutetype... ok: set mutetype to NMUTE \n");
 }
 
 /**
@@ -1059,7 +1081,7 @@ void logSetMutetype(const char* name, bool mutetype)
  * @param name
  * @return
  */
-int logFlieEmpty(const char* name)
+int logFlieEmpty(constr name)
 {
     LogPtr log;
     /* 检测未通过, 返回 err */
@@ -1068,11 +1090,11 @@ int logFlieEmpty(const char* name)
     if(!(log = _check_log(name, "--EmptyFile"))) return LOG_ERR;
 
     if(0 == _logFlieEmpty(log)){
-        logsysAdd(log, "--EmptyFile... ok: Log file had been truncated \n");
+        logsysAdd(name, "--EmptyFile... ok: Log file had been truncated \n");
         return LOG_OK;
     }
     else{
-        logsysAdd(log, "--EmptyFile... err: %s \n", strerror(errno));
+        logsysAdd(name, "--EmptyFile... err: %s \n", strerror(errno));
         logsysShow("--EmptyFile... err: %s \n", strerror(errno));
         return LOG_ERR;
     }
@@ -1082,7 +1104,7 @@ int logFlieEmpty(const char* name)
  * @brief logAddTime - 添加当前时间到 日志 中, 由 (*log).mute 决定是否静默处理
  * @param name
  */
-void logAddTime(const char* name)
+void logAddTime(constr name)
 {
     LogPtr log;
     /* 检测未通过, 返回 err */
@@ -1091,17 +1113,19 @@ void logAddTime(const char* name)
     if(!(log = _check_log(name, "AddTimeStr"))) return;
 
     _logFileShrink(log);
-    fprintf(log->fp, "%s", _timeStr(TS_LOG));
-    if(!log->mutetype)
+
+    fprintf(log->fp, "%s", _timeStr(TS_LOG));   // 写入文件流
+    if(!log->mutetype)                          // 如果需要, 输出到控制台
         fprintf(stderr, "%s", _timeStr(TS_LOG));
-    logsysAdd(log, "add time\n");
+
+    logsysAdd(name, "add time\n");
 }
 
 /**
  * @brief logAddTimeMute - 添加当前时间到 日志 中, 强制静默处理
  * @param name
  */
-void logAddTimeMute(const char* name)
+void logAddTimeMute(constr name)
 {
     LogPtr log;
     /* 检测未通过, 返回 err */
@@ -1110,15 +1134,17 @@ void logAddTimeMute(const char* name)
     if(!(log = _check_log(name, "logAddTimeMute"))) return;
 
     _logFileShrink(log);
-    fprintf(log->fp, "%s", _timeStr(TS_LOG));
-    logsysAdd(log, "add timestr in mute mode\n");
+
+    fprintf(log->fp, "%s", _timeStr(TS_LOG));     // 写入文件流
+
+    logsysAdd(name, "add timestr in mute mode\n");
 }
 
 /**
  * @brief logAddTimeNMute - 添加当前时间到 日志 中, 强制非静默处理
  * @param name
  */
-void logAddTimeNMute(const char* name)
+void logAddTimeNMute(constr name)
 {
     LogPtr log;
     /* 检测未通过, 返回 err */
@@ -1127,9 +1153,11 @@ void logAddTimeNMute(const char* name)
     if(!(log = _check_log(name, "logAddTimeNMute"))) return;
 
     _logFileShrink(log);
-    fprintf(log->fp, "%s", _timeStr(TS_LOG));
-    fprintf(stderr, "%s", _timeStr(TS_LOG));
-    logsysAdd(log, "add timestr in nmute mode\n");
+
+    fprintf(log->fp, "%s", _timeStr(TS_LOG));   // 写入文件流
+    fprintf(stderr, "%s", _timeStr(TS_LOG));    // 输出到控制台
+
+    logsysAdd(name, "add timestr in nmute mode\n");
 }
 
 /**
@@ -1137,7 +1165,7 @@ void logAddTimeNMute(const char* name)
  * @param name
  * @param text  内容
  */
-void logAddText(const char* name, const char* text, ...)
+void logAddText(constr name, constr text, ...)
 {
     if(!text || !(*text)) return;
     LogPtr log;
@@ -1149,15 +1177,23 @@ void logAddText(const char* name, const char* text, ...)
     _logFileShrink(log);
 
     va_list argptr;
-    va_start(argptr, text);
 
+    // 写入文件流
+    pthread_mutex_lock(&fileLocker);
+    va_start(argptr, text);
     vfprintf(log->fp, text, argptr);
+    fflush(log->fp);
+    pthread_mutex_unlock(&fileLocker);
+    // 如果需要, 输出到控制台
     if(!log->mutetype)
     {
+        pthread_mutex_lock(&consoleLocker);
         va_start(argptr, text);
         vfprintf(stderr, text, argptr);
-    }
-    logsysAdd(log, "add a text \n");
+        pthread_mutex_unlock(&consoleLocker);
+    } 
+
+    logsysAdd(name, "add a text \n");
 
     va_end(argptr);
 }
@@ -1166,7 +1202,7 @@ void logAddText(const char* name, const char* text, ...)
  * @param name
  * @param text
  */
-void logAddTextMute(const char* name, const char* text, ...)
+void logAddTextMute(constr name, constr text, ...)
 {
     if(!text || !(*text)) return;
     LogPtr log;
@@ -1178,10 +1214,15 @@ void logAddTextMute(const char* name, const char* text, ...)
     _logFileShrink(log);
 
     va_list argptr;
-    va_start(argptr, text);
 
+    // 写入文件流
+    pthread_mutex_lock(&fileLocker);
+    va_start(argptr, text);
     vfprintf(log->fp, text, argptr);
-    logsysAdd(log, "add a text in mute mode\n");
+    fflush(log->fp);
+    pthread_mutex_unlock(&fileLocker);
+
+    logsysAdd(name, "add a text in mute mode\n");
 
     va_end(argptr);
 }
@@ -1190,7 +1231,7 @@ void logAddTextMute(const char* name, const char* text, ...)
  * @param name
  * @param text
  */
-void logAddTextNMute(const char* name, const char* text, ...)
+void logAddTextNMute(constr name, constr text, ...)
 {
     if(!text || !(*text)) return;
     LogPtr log;
@@ -1203,13 +1244,19 @@ void logAddTextNMute(const char* name, const char* text, ...)
 
     va_list argptr;
 
+    // 写入文件流
+    pthread_mutex_lock(&fileLocker);
     va_start(argptr, text);
     vfprintf(log->fp, text, argptr);
-
+    fflush(log->fp);
+    pthread_mutex_unlock(&fileLocker);
+    // 输出到控制台
+    pthread_mutex_lock(&consoleLocker);
     va_start(argptr, text);
     vfprintf(stderr, text, argptr);
+    pthread_mutex_unlock(&consoleLocker);
 
-    logsysAdd(log, "add a text in nmute mode \n");
+    logsysAdd(name, "add a text in nmute mode \n");
 
     va_end(argptr);
 }
@@ -1220,7 +1267,7 @@ void logAddTextNMute(const char* name, const char* text, ...)
  * @param name
  * @param text
  */
-void logAdd(const char* name, const char* text, ...)
+void logAdd(constr name, constr text, ...)
 {
     if(!text || !(*text))   return;
     LogPtr log;
@@ -1233,22 +1280,29 @@ void logAdd(const char* name, const char* text, ...)
 
     va_list argptr;
 
+    // 添加到文件流中
+    pthread_mutex_lock(&fileLocker);
     va_start(argptr, text);
     fprintf(log->fp, "%s", _timeStr(TS_LOG));
     vfprintf(log->fp, text, argptr);
-
+    fflush(log->fp);
+    pthread_mutex_unlock(&fileLocker);
+    // 如果需要, 输出到控制台
     if(!log->mutetype)
     {
+        pthread_mutex_lock(&consoleLocker);
         va_start(argptr, text);
         fprintf(stderr, "%s", _timeStr(TS_LOG));
         fprintf(stderr, "[%s] :", log->name);
         vfprintf(stderr, text, argptr);
+        pthread_mutex_unlock(&consoleLocker);
     }
-    logsysAdd(log, "add a log\n");
+
+    logsysAdd(name, "add a log\n");
 
     va_end(argptr);
 }
-void logAddMute(const char* name, const char* text, ...)     // 添加 时间 和 text 到 日志中, 强制静默处理
+void logAddMute(constr name, constr text, ...)     // 添加 时间 和 text 到 日志中, 强制静默处理
 {
     if(!text || !(*text))   return;
     LogPtr log;
@@ -1260,12 +1314,16 @@ void logAddMute(const char* name, const char* text, ...)     // 添加 时间 �
     _logFileShrink(log);
 
     va_list argptr;
-    va_start(argptr, text);
 
+    // 写入到文件流中
+    pthread_mutex_lock(&fileLocker);
+    va_start(argptr, text);
     fprintf(log->fp, "%s", _timeStr(TS_LOG));
     vfprintf(log->fp, text, argptr);
+    fflush(log->fp);
+    pthread_mutex_unlock(&fileLocker);
 
-    logsysAdd(log, "add a log in mute mode \n");
+    logsysAdd(name, "add a log in mute mode \n");
 
     va_end(argptr);
 }
@@ -1274,7 +1332,7 @@ void logAddMute(const char* name, const char* text, ...)     // 添加 时间 �
  * @param name
  * @param text
  */
-void logAddNMute(const char* name, const char* text, ...)
+void logAddNMute(constr name, constr text, ...)
 {
     if(!text || !(*text))   return;
     LogPtr log;
@@ -1287,18 +1345,79 @@ void logAddNMute(const char* name, const char* text, ...)
 
     va_list argptr;
 
-    // 添加到文件流中
+    pthread_mutex_lock(&fileLocker);
+    // 写入到文件流中
     va_start(argptr, text);
     fprintf(log->fp, "%s", _timeStr(TS_LOG));
     vfprintf(log->fp, text, argptr);
-
+    fflush(log->fp);
+    pthread_mutex_unlock(&fileLocker);
     // 输出到控制台
+    pthread_mutex_lock(&consoleLocker);
     va_start(argptr, text);
     fprintf(stderr, "%s", _timeStr(TS_LOG));
     fprintf(stderr, "[%s] :", log->name);
     vfprintf(stderr, text, argptr);
+    pthread_mutex_unlock(&consoleLocker);
 
-    logsysAdd(log, "add a log in nmute mode\n");
+    logsysAdd(name, "add a log in nmute mode\n");
+
+    va_end(argptr);
+}
+
+/**
+ * @brief logAddDebug - 调式日志 API, 供 logErr/logWarning/logInfo 使用
+ * @param name
+ * @param text
+ */
+void logAddDebug(constr name, constr text, ...)
+{
+    va_list argptr;
+    LogPtr log;
+    char* file, * func;
+    int line;
+
+    va_start(argptr, text);
+    file = va_arg(argptr, char*);   // 获取文件名
+    line = va_arg(argptr, int);     // 获取行
+    func = va_arg(argptr, char*);   // 获取函数名
+    /* 检查不成功 返回 */
+    if(!_logsys_service){/* 服务未开启, 输出调式信息到控制台, 返回 err */
+        va_start(argptr, text);
+        logsysShow("[logsys err]:%s(%d)-%s: logsys service is off \n", file, line, func);
+        return;
+    }
+    if(!name || !*name) {/* 字串不合法, 添加调式信息到系统日志, 返回 */
+        logsysAdd(name, "[name err]:%s(%d)-%s: name is NULL or empty \n", file, line, func);
+        return ;
+    }
+    log = _logdictFetchValue(_logsys_dic, name);
+    if(!log){/* log 不存在, 添加调式信息到系统日志, 返回 */
+        logsysAdd(name, "[log err]:%s(%d)-%s: log \"%s\" not exist \n", file, line, func, name);
+        return ;
+    }
+
+    _logFileShrink(log);    // 如果需要, 清空日志文件
+
+    // 写入文件流
+    pthread_mutex_lock(&fileLocker);
+    va_start(argptr, text);
+    fprintf(log->fp, "%s", _timeStr(TS_LOG));
+    vfprintf(log->fp, text, argptr);
+    fflush(log->fp);
+    pthread_mutex_unlock(&fileLocker);
+    // 如果需要, 输出日志到控制台
+    if(!log->mutetype)
+    {
+        pthread_mutex_lock(&consoleLocker);
+        va_start(argptr, text);
+        fprintf(stderr, "%s", _timeStr(TS_LOG));
+        fprintf(stderr, "[%s] :", log->name);
+        vfprintf(stderr, text, argptr);
+        pthread_mutex_unlock(&consoleLocker);
+    }
+
+    logsysAdd(name, "add a debug log\n");
 
     va_end(argptr);
 }
@@ -1379,7 +1498,7 @@ int _logdictExpandIfNeeded(logdict *d)
 
 /* ------------------------- private functions ------------------------------ */
 
-static status _GetFileStatus(const char* path)
+static status _GetFileStatus(constr path)
 {
     if (access(path, F_OK) == 0)       // 如果文件存在
     {
@@ -1401,21 +1520,18 @@ static status _GetFileStatus(const char* path)
 */
 char* _timeStr(int type)
 {
-    // static char* timestr = (char*)calloc(30, 1); // C 不支持
     static char timestr[30];    // 因为不大, 所以直接放到 栈 中
-    static struct tm *local;
     static time_t t;
 
-    memset(timestr, 0, 30);
     t = time(NULL);         // 获取日历时间
-    local = localtime(&t);  // 将日历时间转化为本地时间，并保存在 struct tm 结构中
+    // 转换成本地时间, 并根据 type 按指定形式输出到字符串
     switch(type)
     {
-        case TS_LOG:
-            sprintf(timestr, "[%02d-%02d-%02d %02d:%02d:%02d] ",local->tm_year+1900, local->tm_mon, local->tm_mday, local->tm_hour, local->tm_min, local->tm_sec);
+        case TS_LOG:            
+            strftime(timestr, sizeof(timestr), "[%Y-%m-%d %H:%M:%S] ", localtime(&t));
             break;
-        case TS_FILE:
-            sprintf(timestr, "-%02d%02d%02d%02d%02d%02d.out",local->tm_year+1900, local->tm_mon, local->tm_mday, local->tm_hour, local->tm_min, local->tm_sec);
+        case TS_FILE:            
+            strftime(timestr, sizeof(timestr), "-%Y-%m-%d_%H:%M:%S.out", localtime(&t));
             break;
     }
     return timestr;
@@ -1427,7 +1543,7 @@ char* _timeStr(int type)
  * @param  filename 文件名
  * @return 指向一个存储路径的字符串, 不要 free
 */
-static char* _logPath(const char* dir, const char* name)
+static char* _logPath(constr dir, constr name)
 {
     static char/***/ r_path[MAX_PATH_LENGTH + 1]/* = NULL*/;
 //    if(!r_path)
@@ -1446,7 +1562,7 @@ static char* _logPath(const char* dir, const char* name)
  * @param path  路径, 文件夹或文件路径均可
  * @param mode  权限, 推荐 0755
  */
-void _mkdir(const char* path, mode_t mode)
+void _mkdir(constr name, constr path, mode_t mode)
 {
     char* head = strdup(path);
     char* tail = head;
@@ -1456,10 +1572,10 @@ void _mkdir(const char* path, mode_t mode)
         if('/' == *tail)
         {
             *tail = '\0';
-            if(mkdir(head, mode))
-                logsysAdd(NULL, "%s(%d)-[mkdir]: \"%s\" %s\n", __FILE__, __LINE__, head, strerror(errno));
+            if(mkdir(head, mode))   // 创建失败
+                logsysInfo(name, "Can not create dir \"%s\", %s\n", head, strerror(errno));
             else
-                logsysAdd(NULL, "mkdir \"%s\" ok\n", head);
+                logsysInfo(name, "Create dir \"%s\"\n", head);
             *tail = '/';
         }
         tail++;
@@ -1476,7 +1592,7 @@ void _logFileShrink(LogPtr log)
 {
     if(0 != log->maxsize && _logFileSize(log) > log->maxsize)
     {
-        logsysAdd(log, "Test to reach the upper file limitation ~!, Empty file...\n");
+        logsysAdd(log->name, "Test to reach the upper file limitation ~!, Empty file...\n");
         _logFlieEmpty(log);
     }
 }
@@ -1502,45 +1618,42 @@ int _logFlieEmpty(LogPtr log)
  * @param tag   输出标记, 用以区分不同的操作
  * @return
  */
-int _check_logsys(const char* name, const char* tag)
+int _check_logsys(constr name, constr tag)
 {
     if(!_logsys_service){/* 服务未开启, 返回 err */
-        logsysAdd(NULL, "[%s] %s... err: logsys service is off \n", name, tag);
-        return logsysShow("[%s] %s... err: logsys service is off \n", name, tag);
+        return logsysShow("[%s] %s() err: logsys service is off \n", name, tag);
     }
     return LOG_OK;
 }
-int _check_name(const char* name, const char* tag)    // 检查 name 是否合法, 并输出相应提示信息
+int _check_name(constr name, constr tag)    // 检查 name 是否合法, 并输出相应提示信息
 {
-    if(NULL == name || !*name) {/* 字串不合法, 返回 err */
-        logsysAdd(NULL, "[%s] %s... err: name is illegal \n", name, tag);
-        return logsysShow("[%s] %s... err: name is illegal \n", name, tag);
+    if(!name || !*name) {/* 字串不合法, 返回 err */
+        logsysAdd(name, "%s() err: name is illegal \n", tag);
+        return LOG_ERR/*logsysShow("[%s] %s() err: name is illegal \n", name, tag)*/;
     }
     return LOG_OK;
 }
-int _check_path(const char* path, const char* tag)                           // 检查 path 是否合法, 并输出相应提示信息
+int _check_path(constr path, constr tag)                           // 检查 path 是否合法, 并输出相应提示信息
 {
-    if(NULL == path || !*path) {/* 字串不合法, 返回 err */
-        logsysAdd(NULL, "[%s] %s... err: path is illegal \n", path, tag);
-        return logsysShow("[%s] %s... err: path is illegal \n", path, tag);
+    if(!path || !*path) {/* 字串不合法, 返回 err */
+        logsysAdd(NULL, "[%s] %s() err: path is illegal \n", path, tag);
+        return LOG_ERR;
     }
     return LOG_OK;
 }
-LogPtr _check_log(const char* name, const char* tag)                            // 检查 log 是否存在, 并输出相应提示信息
+LogPtr _check_log(constr name, constr tag)                            // 检查 log 是否存在, 并输出相应提示信息
 {
     /* 未找到指定的 log, 返回 err */
     LogPtr r_log = _logdictFetchValue(_logsys_dic, name);
-    if(!r_log){
-        logsysAdd(NULL, "[%s] %s... err: log not exist \n", name, tag);
-        logsysShow("[%s] %s... err: log not exist \n", name, tag);
-    }
+    if(!r_log)
+        logsysAdd(name, "%s() err: log not exist \n", tag);
     return r_log;
 }
-int _check_size_mb(size_t size_mb, const char* name, const char* tag)
+int _check_size_mb(size_t size_mb, constr name, constr tag)
 {
     if(size_mb > INT_MAX>>20){/* 大小不合法, 返回 err */
-        logsysAdd(NULL, "[%s] %s... err: too large to set \n", name, tag);
-        return logsysShow("[%s] %s... err: too large to set \n", name, tag);
+        logsysAdd(NULL, "[%s] %s() err: too large to set \n", name, tag);
+        return LOG_ERR;
     }
     return LOG_OK;
 }

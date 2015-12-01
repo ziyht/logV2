@@ -11,3 +11,5 @@ HEADERS += \
     log.h \
     logtest.h
 
+LIBS += \
+    -lpthread
